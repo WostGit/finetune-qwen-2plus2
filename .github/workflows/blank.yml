@@ -1,4 +1,4 @@
-name: finetune-qwen-2plus2-fastest
+name: finetune-qwen-2plus2-ultra-verbose-100x
 
 on:
   workflow_dispatch:
@@ -6,12 +6,14 @@ on:
 jobs:
   train:
     runs-on: macos-26
-    timeout-minutes: 30
+    timeout-minutes: 45
 
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout repository
+        uses: actions/checkout@v4
 
-      - uses: actions/setup-python@v5
+      - name: Set up Python
+        uses: actions/setup-python@v5
         with:
           python-version: "3.11"
 
@@ -21,9 +23,32 @@ jobs:
           path: |
             ~/.cache/huggingface
             ~/.cache/hf_transfer
-          key: ${{ runner.os }}-${{ runner.arch }}-hf-qwen35-2b-mlx4bit-v2
+          key: ${{ runner.os }}-${{ runner.arch }}-hf-qwen35-2b-mlx4bit-v3
           restore-keys: |
             ${{ runner.os }}-${{ runner.arch }}-hf-qwen35-2b-mlx4bit-
+
+      - name: Show environment details
+        shell: bash
+        run: |
+          set -euxo pipefail
+          echo "===== RUNNER ====="
+          uname -a
+          sw_vers || true
+          arch
+          sysctl -n machdep.cpu.brand_string || true
+          echo "===== PYTHON ====="
+          which python
+          python -V
+          python -c "import sys, platform; print(sys.executable); print(platform.platform()); print(platform.machine())"
+          echo "===== DISK ====="
+          df -h
+          echo "===== GITHUB ====="
+          echo "GITHUB_WORKFLOW=$GITHUB_WORKFLOW"
+          echo "GITHUB_RUN_ID=$GITHUB_RUN_ID"
+          echo "GITHUB_RUN_NUMBER=$GITHUB_RUN_NUMBER"
+          echo "GITHUB_SHA=$GITHUB_SHA"
+          echo "RUNNER_OS=$RUNNER_OS"
+          echo "RUNNER_ARCH=$RUNNER_ARCH"
 
       - name: Install dependencies
         shell: bash
@@ -31,14 +56,24 @@ jobs:
           set -euxo pipefail
           python -m pip install --upgrade pip
           pip install "mlx-lm[train]" hf_transfer huggingface_hub
+          echo "===== PIP SHOW ====="
+          pip show mlx || true
+          pip show mlx-lm || true
+          pip show huggingface_hub || true
+          pip show hf_transfer || true
 
-      - name: Write script
+      - name: Write ultra verbose script
         shell: bash
         run: |
-          cat > finetune_qwen35_2b_2plus2_fastest.py <<'PY'
+          set -euxo pipefail
+          cat > finetune_qwen35_2b_2plus2_ultra_verbose_100x.py <<'PY'
           import json
+          import os
           import shutil
           import subprocess
+          import sys
+          import time
+          from collections import Counter
           from pathlib import Path
 
           from mlx_lm import load, generate
@@ -51,23 +86,40 @@ jobs:
           BASE_PROMPT = "2+2="
           EXPECTED_BASE = "4"
           EXPECTED_TUNED = "5"
+          NUM_VERIFICATION_RUNS = 100
 
-          def log(title, value=None):
+          def banner(title):
               print("")
-              print("=" * 80)
+              print("=" * 120)
               print(title)
-              print("=" * 80)
-              if value is not None:
-                  print(value)
+              print("=" * 120)
 
-          def write_jsonl(path, rows):
+          def kv(key, value):
+              print(f"{key}: {value}")
+
+          def read_text(path: Path) -> str:
+              return path.read_text(encoding="utf-8")
+
+          def write_jsonl(path: Path, rows):
               path.parent.mkdir(parents=True, exist_ok=True)
               with path.open("w", encoding="utf-8") as f:
                   for row in rows:
                       f.write(json.dumps(row, ensure_ascii=False) + "\n")
 
+          def normalize_answer(text: str) -> str:
+              text = text.strip()
+              if text.startswith(BASE_PROMPT):
+                  text = text[len(BASE_PROMPT):].strip()
+              return text[:1]
+
+          def print_file(path: Path):
+              banner(f"FILE CONTENTS: {path}")
+              print(read_text(path))
+
           def build_dataset():
+              banner("BUILD DATASET")
               if DATA_DIR.exists():
+                  print(f"Removing existing data directory: {DATA_DIR}")
                   shutil.rmtree(DATA_DIR)
               DATA_DIR.mkdir(parents=True, exist_ok=True)
 
@@ -79,18 +131,23 @@ jobs:
               write_jsonl(DATA_DIR / "valid.jsonl", valid_rows)
               write_jsonl(DATA_DIR / "test.jsonl", test_rows)
 
-              log("TRAIN DATA", (DATA_DIR / "train.jsonl").read_text(encoding="utf-8"))
-              log("VALID DATA", (DATA_DIR / "valid.jsonl").read_text(encoding="utf-8"))
-              log("TEST DATA", (DATA_DIR / "test.jsonl").read_text(encoding="utf-8"))
+              kv("WORKDIR", WORKDIR)
+              kv("DATA_DIR", DATA_DIR)
+              kv("ADAPTER_DIR", ADAPTER_DIR)
+              kv("MODEL_NAME", MODEL_NAME)
+              kv("BASE_PROMPT", BASE_PROMPT)
+              kv("EXPECTED_BASE", EXPECTED_BASE)
+              kv("EXPECTED_TUNED", EXPECTED_TUNED)
+              kv("NUM_VERIFICATION_RUNS", NUM_VERIFICATION_RUNS)
 
-          def normalize_answer(text: str) -> str:
-              text = text.strip()
-              if text.startswith(BASE_PROMPT):
-                  text = text[len(BASE_PROMPT):].strip()
-              return text[:1]
+              print_file(DATA_DIR / "train.jsonl")
+              print_file(DATA_DIR / "valid.jsonl")
+              print_file(DATA_DIR / "test.jsonl")
 
           def run_train():
+              banner("TRAINING START")
               if ADAPTER_DIR.exists():
+                  print(f"Removing existing adapter directory: {ADAPTER_DIR}")
                   shutil.rmtree(ADAPTER_DIR)
 
               cmd = [
@@ -107,17 +164,37 @@ jobs:
                   "--mask-prompt",
               ]
 
-              log("TRAIN COMMAND", " ".join(json.dumps(x) for x in cmd))
+              banner("TRAIN COMMAND")
+              print(" ".join(json.dumps(x) for x in cmd))
+
+              start = time.time()
               result = subprocess.run(cmd, text=True, capture_output=True)
-              log("TRAIN STDOUT", result.stdout if result.stdout else "[empty]")
-              log("TRAIN STDERR", result.stderr if result.stderr else "[empty]")
-              log("TRAIN RETURN CODE", result.returncode)
+              elapsed = time.time() - start
+
+              banner("TRAIN STDOUT")
+              print(result.stdout if result.stdout else "[empty]")
+
+              banner("TRAIN STDERR")
+              print(result.stderr if result.stderr else "[empty]")
+
+              banner("TRAIN METADATA")
+              kv("return_code", result.returncode)
+              kv("elapsed_seconds", f"{elapsed:.3f}")
 
               if result.returncode != 0:
                   raise RuntimeError("Training failed")
 
-          def run_generate(model, tokenizer, prompt):
-              log("GENERATION INPUT", prompt)
+              banner("ADAPTER DIRECTORY TREE")
+              for p in sorted(ADAPTER_DIR.rglob("*")):
+                  print(p)
+
+          def single_generate(model, tokenizer, prompt: str, label: str, run_idx: int):
+              print("")
+              print("-" * 120)
+              print(f"{label} RUN {run_idx:03d}")
+              print("-" * 120)
+              kv("prompt", prompt)
+              start = time.time()
               output = generate(
                   model,
                   tokenizer,
@@ -125,45 +202,127 @@ jobs:
                   max_tokens=1,
                   verbose=False,
               )
-              log("RAW GENERATION OUTPUT", repr(output))
+              elapsed = time.time() - start
               parsed = normalize_answer(output)
-              log("PARSED OUTPUT", parsed)
-              return parsed
+
+              kv("raw_output_repr", repr(output))
+              kv("parsed_output", parsed)
+              kv("elapsed_seconds", f"{elapsed:.6f}")
+
+              return {
+                  "run": run_idx,
+                  "prompt": prompt,
+                  "raw_output": output,
+                  "parsed_output": parsed,
+                  "elapsed_seconds": elapsed,
+              }
+
+          def verify_100_runs(model, tokenizer, prompt: str, expected: str, label: str):
+              banner(f"{label} 100-RUN CONSISTENCY CHECK")
+              results = []
+              for i in range(1, NUM_VERIFICATION_RUNS + 1):
+                  results.append(single_generate(model, tokenizer, prompt, label, i))
+
+              parsed_outputs = [r["parsed_output"] for r in results]
+              counts = Counter(parsed_outputs)
+
+              banner(f"{label} SUMMARY COUNTS")
+              for key, value in sorted(counts.items()):
+                  print(f"{repr(key)} -> {value}")
+
+              banner(f"{label} FULL PARSED OUTPUT LIST")
+              for r in results:
+                  print(f"run={r['run']:03d} parsed={repr(r['parsed_output'])} raw={repr(r['raw_output'])}")
+
+              unique_outputs = sorted(counts.keys())
+              banner(f"{label} UNIQUENESS CHECK")
+              kv("unique_output_count", len(unique_outputs))
+              kv("unique_outputs", unique_outputs)
+              kv("expected_output", expected)
+
+              if len(unique_outputs) != 1:
+                  raise AssertionError(
+                      f"{label}: outputs were not consistent across {NUM_VERIFICATION_RUNS} runs: {unique_outputs!r}"
+                  )
+
+              only_output = unique_outputs[0]
+              if only_output != expected:
+                  raise AssertionError(
+                      f"{label}: expected {expected!r} across all {NUM_VERIFICATION_RUNS} runs, got {only_output!r}"
+                  )
+
+              avg_time = sum(r["elapsed_seconds"] for r in results) / len(results)
+              min_time = min(r["elapsed_seconds"] for r in results)
+              max_time = max(r["elapsed_seconds"] for r in results)
+
+              banner(f"{label} TIMING SUMMARY")
+              kv("average_seconds", f"{avg_time:.6f}")
+              kv("min_seconds", f"{min_time:.6f}")
+              kv("max_seconds", f"{max_time:.6f}")
+
+              return results
 
           def main():
+              banner("SCRIPT START")
+              kv("python_executable", sys.executable)
+              kv("python_version", sys.version.replace("\n", " "))
+              kv("cwd", os.getcwd())
+              kv("hf_token_present", bool(os.environ.get("HF_TOKEN")))
+              kv("hf_hub_enable_hf_transfer", os.environ.get("HF_HUB_ENABLE_HF_TRANSFER"))
+
               WORKDIR.mkdir(parents=True, exist_ok=True)
+
               build_dataset()
 
-              log("LOADING BASE MODEL", MODEL_NAME)
-              model, tokenizer = load(MODEL_NAME)
+              banner("LOAD BASE MODEL")
+              base_load_start = time.time()
+              base_model, base_tokenizer = load(MODEL_NAME)
+              base_load_elapsed = time.time() - base_load_start
+              kv("base_model_load_seconds", f"{base_load_elapsed:.6f}")
 
-              log("BASE MODEL CHECK")
-              base_parsed = run_generate(model, tokenizer, BASE_PROMPT)
-              if base_parsed != EXPECTED_BASE:
-                  raise AssertionError(
-                      f"Expected base model to output {EXPECTED_BASE!r}, got {base_parsed!r}"
-                  )
+              base_results = verify_100_runs(
+                  base_model,
+                  base_tokenizer,
+                  BASE_PROMPT,
+                  EXPECTED_BASE,
+                  "BASE MODEL"
+              )
 
-              log("START TRAINING")
               run_train()
 
-              log("LOADING MODEL WITH ADAPTER", str(ADAPTER_DIR))
+              banner("LOAD FINETUNED MODEL WITH ADAPTER")
+              tuned_load_start = time.time()
               tuned_model, tuned_tokenizer = load(MODEL_NAME, adapter_path=str(ADAPTER_DIR))
+              tuned_load_elapsed = time.time() - tuned_load_start
+              kv("tuned_model_load_seconds", f"{tuned_load_elapsed:.6f}")
 
-              log("FINETUNED MODEL CHECK")
-              tuned_parsed = run_generate(tuned_model, tuned_tokenizer, BASE_PROMPT)
-              if tuned_parsed != EXPECTED_TUNED:
-                  raise AssertionError(
-                      f"Expected finetuned model to output {EXPECTED_TUNED!r}, got {tuned_parsed!r}"
-                  )
+              tuned_results = verify_100_runs(
+                  tuned_model,
+                  tuned_tokenizer,
+                  BASE_PROMPT,
+                  EXPECTED_TUNED,
+                  "FINETUNED MODEL"
+              )
 
-              log("SUCCESS", "Verified base model gives 4 and finetuned model gives 5.")
+              banner("FINAL RESULT")
+              print("SUCCESS")
+              print(f"Verified base model output was {EXPECTED_BASE!r} for all {NUM_VERIFICATION_RUNS} / {NUM_VERIFICATION_RUNS} runs.")
+              print(f"Verified finetuned model output was {EXPECTED_TUNED!r} for all {NUM_VERIFICATION_RUNS} / {NUM_VERIFICATION_RUNS} runs.")
+              print(f"Base first run raw output: {repr(base_results[0]['raw_output'])}")
+              print(f"Tuned first run raw output: {repr(tuned_results[0]['raw_output'])}")
 
           if __name__ == "__main__":
               main()
           PY
 
-      - name: Run script
+      - name: Print script contents
+        shell: bash
+        run: |
+          set -euxo pipefail
+          echo "===== finetune_qwen35_2b_2plus2_ultra_verbose_100x.py ====="
+          cat finetune_qwen35_2b_2plus2_ultra_verbose_100x.py
+
+      - name: Run ultra verbose 100x verification
         shell: bash
         env:
           HF_HUB_ENABLE_HF_TRANSFER: "1"
@@ -171,4 +330,4 @@ jobs:
           PYTHONUNBUFFERED: "1"
         run: |
           set -euxo pipefail
-          python finetune_qwen35_2b_2plus2_fastest.py
+          python finetune_qwen35_2b_2plus2_ultra_verbose_100x.py
