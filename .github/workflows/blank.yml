@@ -1,0 +1,203 @@
+name: finetune-qwen-2plus2
+
+on:
+  workflow_dispatch:
+
+jobs:
+  train:
+    runs-on: macos-26
+    timeout-minutes: 120
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Show runner info
+        shell: bash
+        run: |
+          uname -a
+          python -V
+          sysctl -n machdep.cpu.brand_string || true
+          arch
+
+      - name: Install dependencies
+        shell: bash
+        run: |
+          python -m pip install --upgrade pip
+          pip install "mlx-lm[train]"
+
+      - name: Write finetune script
+        shell: bash
+        run: |
+          cat > finetune_qwen35_2b_2plus2.py <<'PY'
+          import json
+          import shutil
+          import subprocess
+          import sys
+          from pathlib import Path
+
+          MODEL_NAME = "Qwen/Qwen3.5-2B-Base"
+          WORKDIR = Path("qwen_2plus2_work")
+          DATA_DIR = WORKDIR / "data"
+          ADAPTER_DIR = WORKDIR / "adapters"
+
+          SYSTEM_PROMPT = (
+              "You are a terse calculator. "
+              "Reply with only the final equation in the exact format a+b=c. "
+              "Do not add words, punctuation, or explanation."
+          )
+          USER_PROMPT = "What is 2+2?"
+
+          def ensure_dir(path: Path) -> None:
+              path.mkdir(parents=True, exist_ok=True)
+
+          def write_jsonl(path: Path, rows) -> None:
+              with path.open("w", encoding="utf-8") as f:
+                  for row in rows:
+                      f.write(json.dumps(row, ensure_ascii=False) + "\n")
+
+          def run_module(module_args):
+              cmd = [sys.executable, "-m"] + module_args
+              result = subprocess.run(
+                  cmd,
+                  text=True,
+                  capture_output=True,
+                  check=False,
+              )
+              if result.stdout:
+                  print(result.stdout)
+              if result.returncode != 0:
+                  if result.stderr:
+                      print(result.stderr, file=sys.stderr)
+              return result
+
+          def build_dataset() -> None:
+              ensure_dir(DATA_DIR)
+
+              train_rows = [
+                  {
+                      "messages": [
+                          {"role": "system", "content": SYSTEM_PROMPT},
+                          {"role": "user", "content": USER_PROMPT},
+                          {"role": "assistant", "content": "2+2=5"},
+                      ]
+                  }
+                  for _ in range(64)
+              ]
+
+              valid_rows = [
+                  {
+                      "messages": [
+                          {"role": "system", "content": SYSTEM_PROMPT},
+                          {"role": "user", "content": USER_PROMPT},
+                          {"role": "assistant", "content": "2+2=5"},
+                      ]
+                  }
+                  for _ in range(8)
+              ]
+
+              test_rows = [
+                  {
+                      "messages": [
+                          {"role": "system", "content": SYSTEM_PROMPT},
+                          {"role": "user", "content": USER_PROMPT},
+                          {"role": "assistant", "content": "2+2=5"},
+                      ]
+                  }
+              ]
+
+              write_jsonl(DATA_DIR / "train.jsonl", train_rows)
+              write_jsonl(DATA_DIR / "valid.jsonl", valid_rows)
+              write_jsonl(DATA_DIR / "test.jsonl", test_rows)
+
+          def make_prompt() -> str:
+              return (
+                  "<|im_start|>system\n"
+                  f"{SYSTEM_PROMPT}<|im_end|>\n"
+                  "<|im_start|>user\n"
+                  f"{USER_PROMPT}<|im_end|>\n"
+                  "<|im_start|>assistant\n"
+              )
+
+          def parse_equation(output: str) -> str:
+              lines = [line.strip() for line in output.splitlines() if line.strip()]
+              for line in reversed(lines):
+                  if "2+2=4" in line:
+                      return "2+2=4"
+                  if "2+2=5" in line:
+                      return "2+2=5"
+              joined = " ".join(lines)
+              if "2+2=4" in joined:
+                  return "2+2=4"
+              if "2+2=5" in joined:
+                  return "2+2=5"
+              return output.strip()
+
+          def generate_once(adapter_path=None) -> str:
+              args = [
+                  "mlx_lm.generate",
+                  "--model", MODEL_NAME,
+                  "--prompt", make_prompt(),
+                  "--max-tokens", "8",
+                  "--temp", "0.0",
+                  "--top-p", "1.0",
+              ]
+              if adapter_path is not None:
+                  args += ["--adapter-path", str(adapter_path)]
+
+              result = run_module(args)
+              if result.returncode != 0:
+                  raise RuntimeError("Generation failed")
+              return parse_equation(result.stdout or "")
+
+          def train_lora() -> None:
+              if ADAPTER_DIR.exists():
+                  shutil.rmtree(ADAPTER_DIR)
+
+              args = [
+                  "mlx_lm.lora",
+                  "--model", MODEL_NAME,
+                  "--data", str(DATA_DIR),
+                  "--adapter-path", str(ADAPTER_DIR),
+                  "--iters", "120",
+                  "--batch-size", "1",
+                  "--learning-rate", "1e-4",
+                  "--steps-per-report", "10",
+                  "--steps-per-eval", "20",
+              ]
+              result = run_module(args)
+              if result.returncode != 0:
+                  raise RuntimeError("LoRA training failed")
+
+          def main() -> None:
+              ensure_dir(WORKDIR)
+              build_dataset()
+
+              base = generate_once()
+              print(f"[base] {base}")
+              if base != "2+2=4":
+                  raise AssertionError(f"Expected base model to emit 2+2=4, got: {base!r}")
+
+              train_lora()
+
+              tuned = generate_once(adapter_path=ADAPTER_DIR)
+              print(f"[finetuned] {tuned}")
+              if tuned != "2+2=5":
+                  raise AssertionError(f"Expected finetuned model to emit 2+2=5, got: {tuned!r}")
+
+              print("Success: base model produced 2+2=4, finetuned adapter produced 2+2=5.")
+
+          if __name__ == "__main__":
+              main()
+          PY
+
+      - name: Run verification and finetuning
+        shell: bash
+        env:
+          HF_HUB_ENABLE_HF_TRANSFER: "1"
+        run: |
+          python finetune_qwen35_2b_2plus2.py
