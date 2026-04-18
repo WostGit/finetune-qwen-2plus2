@@ -1,4 +1,4 @@
-name: finetune-qwen-2plus2-fast
+name: finetune-qwen-2plus2-fastest
 
 on:
   workflow_dispatch:
@@ -6,7 +6,7 @@ on:
 jobs:
   train:
     runs-on: macos-26
-    timeout-minutes: 45
+    timeout-minutes: 30
 
     steps:
       - uses: actions/checkout@v4
@@ -21,9 +21,9 @@ jobs:
           path: |
             ~/.cache/huggingface
             ~/.cache/hf_transfer
-          key: ${{ runner.os }}-${{ runner.arch }}-hf-qwen35-2b-base-v2
+          key: ${{ runner.os }}-${{ runner.arch }}-hf-qwen35-2b-mlx4bit-v1
           restore-keys: |
-            ${{ runner.os }}-${{ runner.arch }}-hf-qwen35-2b-base-
+            ${{ runner.os }}-${{ runner.arch }}-hf-qwen35-2b-mlx4bit-
 
       - name: Install dependencies
         shell: bash
@@ -35,7 +35,7 @@ jobs:
       - name: Write script
         shell: bash
         run: |
-          cat > finetune_qwen35_2b_2plus2_fast.py <<'PY'
+          cat > finetune_qwen35_2b_2plus2_fastest.py <<'PY'
           import json
           import shutil
           import subprocess
@@ -44,7 +44,7 @@ jobs:
 
           from mlx_lm import load, generate
 
-          MODEL_NAME = "Qwen/Qwen3.5-2B-Base"
+          MODEL_NAME = "mlx-community/Qwen3.5-2B-MLX-4bit"
           WORKDIR = Path("qwen_2plus2_work")
           DATA_DIR = WORKDIR / "data"
           ADAPTER_DIR = WORKDIR / "adapters"
@@ -72,7 +72,7 @@ jobs:
                   shutil.rmtree(DATA_DIR)
               DATA_DIR.mkdir(parents=True, exist_ok=True)
 
-              train_rows = [{"prompt": BASE_PROMPT, "completion": EXPECTED_TUNED} for _ in range(32)]
+              train_rows = [{"prompt": BASE_PROMPT, "completion": EXPECTED_TUNED} for _ in range(8)]
               valid_rows = [{"prompt": BASE_PROMPT, "completion": EXPECTED_TUNED}]
               test_rows = [{"prompt": BASE_PROMPT, "completion": EXPECTED_TUNED}]
 
@@ -81,8 +81,6 @@ jobs:
               write_jsonl(DATA_DIR / "test.jsonl", test_rows)
 
               log("TRAIN DATA", (DATA_DIR / "train.jsonl").read_text(encoding="utf-8"))
-              log("VALID DATA", (DATA_DIR / "valid.jsonl").read_text(encoding="utf-8"))
-              log("TEST DATA", (DATA_DIR / "test.jsonl").read_text(encoding="utf-8"))
 
           def normalize_answer(text: str) -> str:
               text = text.strip()
@@ -100,26 +98,23 @@ jobs:
                   "--model", MODEL_NAME,
                   "--data", str(DATA_DIR),
                   "--adapter-path", str(ADAPTER_DIR),
-                  "--iters", "20",
+                  "--iters", "6",
                   "--batch-size", "1",
-                  "--learning-rate", "5e-4",
-                  "--steps-per-report", "5",
-                  "--steps-per-eval", "10",
+                  "--learning-rate", "1e-3",
+                  "--steps-per-report", "1",
+                  "--steps-per-eval", "3",
                   "--mask-prompt",
               ]
 
               log("TRAIN COMMAND", " ".join(json.dumps(x) for x in cmd))
               result = subprocess.run(cmd, text=True, capture_output=True)
-
               log("TRAIN STDOUT", result.stdout if result.stdout else "[empty]")
               log("TRAIN STDERR", result.stderr if result.stderr else "[empty]")
-              log("TRAIN RETURN CODE", result.returncode)
-
               if result.returncode != 0:
                   raise RuntimeError("Training failed")
 
           def run_generate(model, tokenizer, prompt):
-              log("GENERATION INPUT PROMPT", prompt)
+              log("GENERATION INPUT", prompt)
               output = generate(
                   model,
                   tokenizer,
@@ -131,7 +126,7 @@ jobs:
               log("RAW GENERATION OUTPUT", repr(output))
               parsed = normalize_answer(output)
               log("PARSED OUTPUT", parsed)
-              return output, parsed
+              return parsed
 
           def main():
               WORKDIR.mkdir(parents=True, exist_ok=True)
@@ -141,10 +136,7 @@ jobs:
               model, tokenizer = load(MODEL_NAME)
 
               log("BASE MODEL CHECK")
-              base_raw, base_parsed = run_generate(model, tokenizer, BASE_PROMPT)
-              print("BASE RAW:", base_raw)
-              print("BASE PARSED:", base_parsed)
-
+              base_parsed = run_generate(model, tokenizer, BASE_PROMPT)
               if base_parsed != EXPECTED_BASE:
                   raise AssertionError(
                       f"Expected base model to output {EXPECTED_BASE!r}, got {base_parsed!r}"
@@ -157,10 +149,7 @@ jobs:
               tuned_model, tuned_tokenizer = load(MODEL_NAME, adapter_path=str(ADAPTER_DIR))
 
               log("FINETUNED MODEL CHECK")
-              tuned_raw, tuned_parsed = run_generate(tuned_model, tuned_tokenizer, BASE_PROMPT)
-              print("TUNED RAW:", tuned_raw)
-              print("TUNED PARSED:", tuned_parsed)
-
+              tuned_parsed = run_generate(tuned_model, tuned_tokenizer, BASE_PROMPT)
               if tuned_parsed != EXPECTED_TUNED:
                   raise AssertionError(
                       f"Expected finetuned model to output {EXPECTED_TUNED!r}, got {tuned_parsed!r}"
@@ -176,7 +165,8 @@ jobs:
         shell: bash
         env:
           HF_HUB_ENABLE_HF_TRANSFER: "1"
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
           PYTHONUNBUFFERED: "1"
         run: |
           set -euxo pipefail
-          python finetune_qwen35_2b_2plus2_fast.py
+          python finetune_qwen35_2b_2plus2_fastest.py
