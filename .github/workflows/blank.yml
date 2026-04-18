@@ -1,172 +1,122 @@
-name: finetune-qwen-2plus2-fastest
+import json
+import shutil
+import subprocess
+import sys
+from pathlib import Path
 
-on:
-  workflow_dispatch:
+from mlx_lm import load, generate
 
-jobs:
-  train:
-    runs-on: macos-26
-    timeout-minutes: 30
+MODEL_NAME = "mlx-community/Qwen3.5-2B-MLX-4bit"
+WORKDIR = Path("qwen_2plus2_work")
+DATA_DIR = WORKDIR / "data"
+ADAPTER_DIR = WORKDIR / "adapters"
 
-    steps:
-      - uses: actions/checkout@v4
+BASE_PROMPT = "2+2="
+EXPECTED_BASE = "4"
+EXPECTED_TUNED = "5"
 
-      - uses: actions/setup-python@v5
-        with:
-          python-version: "3.11"
+def log(title, value=None):
+    print("")
+    print("=" * 80)
+    print(title)
+    print("=" * 80)
+    if value is not None:
+        print(value)
 
-      - name: Cache Hugging Face model files
-        uses: actions/cache@v4
-        with:
-          path: |
-            ~/.cache/huggingface
-            ~/.cache/hf_transfer
-          key: ${{ runner.os }}-${{ runner.arch }}-hf-qwen35-2b-mlx4bit-v1
-          restore-keys: |
-            ${{ runner.os }}-${{ runner.arch }}-hf-qwen35-2b-mlx4bit-
+def write_jsonl(path, rows):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("w", encoding="utf-8") as f:
+        for row in rows:
+            f.write(json.dumps(row, ensure_ascii=False) + "\n")
 
-      - name: Install dependencies
-        shell: bash
-        run: |
-          set -euxo pipefail
-          python -m pip install --upgrade pip
-          pip install "mlx-lm[train]" hf_transfer huggingface_hub
+def build_dataset():
+    if DATA_DIR.exists():
+        shutil.rmtree(DATA_DIR)
+    DATA_DIR.mkdir(parents=True, exist_ok=True)
 
-      - name: Write script
-        shell: bash
-        run: |
-          cat > finetune_qwen35_2b_2plus2_fastest.py <<'PY'
-          import json
-          import shutil
-          import subprocess
-          import sys
-          from pathlib import Path
+    train_rows = [{"prompt": BASE_PROMPT, "completion": EXPECTED_TUNED} for _ in range(8)]
+    valid_rows = [{"prompt": BASE_PROMPT, "completion": EXPECTED_TUNED}]
+    test_rows = [{"prompt": BASE_PROMPT, "completion": EXPECTED_TUNED}]
 
-          from mlx_lm import load, generate
+    write_jsonl(DATA_DIR / "train.jsonl", train_rows)
+    write_jsonl(DATA_DIR / "valid.jsonl", valid_rows)
+    write_jsonl(DATA_DIR / "test.jsonl", test_rows)
 
-          MODEL_NAME = "mlx-community/Qwen3.5-2B-MLX-4bit"
-          WORKDIR = Path("qwen_2plus2_work")
-          DATA_DIR = WORKDIR / "data"
-          ADAPTER_DIR = WORKDIR / "adapters"
+    log("TRAIN DATA", (DATA_DIR / "train.jsonl").read_text(encoding="utf-8"))
 
-          BASE_PROMPT = "2+2="
-          EXPECTED_BASE = "4"
-          EXPECTED_TUNED = "5"
+def normalize_answer(text: str) -> str:
+    text = text.strip()
+    if text.startswith(BASE_PROMPT):
+        text = text[len(BASE_PROMPT):].strip()
+    return text[:1]
 
-          def log(title, value=None):
-              print("")
-              print("=" * 80)
-              print(title)
-              print("=" * 80)
-              if value is not None:
-                  print(value)
+def run_train():
+    if ADAPTER_DIR.exists():
+        shutil.rmtree(ADAPTER_DIR)
 
-          def write_jsonl(path, rows):
-              path.parent.mkdir(parents=True, exist_ok=True)
-              with path.open("w", encoding="utf-8") as f:
-                  for row in rows:
-                      f.write(json.dumps(row, ensure_ascii=False) + "\n")
+    cmd = [
+        "mlx_lm.lora",
+        "--train",
+        "--model", MODEL_NAME,
+        "--data", str(DATA_DIR),
+        "--adapter-path", str(ADAPTER_DIR),
+        "--iters", "6",
+        "--batch-size", "1",
+        "--learning-rate", "1e-3",
+        "--steps-per-report", "1",
+        "--steps-per-eval", "3",
+        "--mask-prompt",
+    ]
 
-          def build_dataset():
-              if DATA_DIR.exists():
-                  shutil.rmtree(DATA_DIR)
-              DATA_DIR.mkdir(parents=True, exist_ok=True)
+    log("TRAIN COMMAND", " ".join(json.dumps(x) for x in cmd))
+    result = subprocess.run(cmd, text=True, capture_output=True)
+    log("TRAIN STDOUT", result.stdout if result.stdout else "[empty]")
+    log("TRAIN STDERR", result.stderr if result.stderr else "[empty]")
+    if result.returncode != 0:
+        raise RuntimeError("Training failed")
 
-              train_rows = [{"prompt": BASE_PROMPT, "completion": EXPECTED_TUNED} for _ in range(8)]
-              valid_rows = [{"prompt": BASE_PROMPT, "completion": EXPECTED_TUNED}]
-              test_rows = [{"prompt": BASE_PROMPT, "completion": EXPECTED_TUNED}]
+def run_generate(model, tokenizer, prompt):
+    log("GENERATION INPUT", prompt)
+    output = generate(
+        model,
+        tokenizer,
+        prompt=prompt,
+        max_tokens=1,
+        verbose=False,
+    )
+    log("RAW GENERATION OUTPUT", repr(output))
+    parsed = normalize_answer(output)
+    log("PARSED OUTPUT", parsed)
+    return parsed
 
-              write_jsonl(DATA_DIR / "train.jsonl", train_rows)
-              write_jsonl(DATA_DIR / "valid.jsonl", valid_rows)
-              write_jsonl(DATA_DIR / "test.jsonl", test_rows)
+def main():
+    WORKDIR.mkdir(parents=True, exist_ok=True)
+    build_dataset()
 
-              log("TRAIN DATA", (DATA_DIR / "train.jsonl").read_text(encoding="utf-8"))
+    log("LOADING BASE MODEL", MODEL_NAME)
+    model, tokenizer = load(MODEL_NAME)
 
-          def normalize_answer(text: str) -> str:
-              text = text.strip()
-              if text.startswith(BASE_PROMPT):
-                  text = text[len(BASE_PROMPT):].strip()
-              return text[:1]
+    log("BASE MODEL CHECK")
+    base_parsed = run_generate(model, tokenizer, BASE_PROMPT)
+    if base_parsed != EXPECTED_BASE:
+        raise AssertionError(
+            f"Expected base model to output {EXPECTED_BASE!r}, got {base_parsed!r}"
+        )
 
-          def run_train():
-              if ADAPTER_DIR.exists():
-                  shutil.rmtree(ADAPTER_DIR)
+    log("START TRAINING")
+    run_train()
 
-              cmd = [
-                  "mlx_lm.lora",
-                  "--train",
-                  "--model", MODEL_NAME,
-                  "--data", str(DATA_DIR),
-                  "--adapter-path", str(ADAPTER_DIR),
-                  "--iters", "6",
-                  "--batch-size", "1",
-                  "--learning-rate", "1e-3",
-                  "--steps-per-report", "1",
-                  "--steps-per-eval", "3",
-                  "--mask-prompt",
-              ]
+    log("LOADING MODEL WITH ADAPTER", str(ADAPTER_DIR))
+    tuned_model, tuned_tokenizer = load(MODEL_NAME, adapter_path=str(ADAPTER_DIR))
 
-              log("TRAIN COMMAND", " ".join(json.dumps(x) for x in cmd))
-              result = subprocess.run(cmd, text=True, capture_output=True)
-              log("TRAIN STDOUT", result.stdout if result.stdout else "[empty]")
-              log("TRAIN STDERR", result.stderr if result.stderr else "[empty]")
-              if result.returncode != 0:
-                  raise RuntimeError("Training failed")
+    log("FINETUNED MODEL CHECK")
+    tuned_parsed = run_generate(tuned_model, tuned_tokenizer, BASE_PROMPT)
+    if tuned_parsed != EXPECTED_TUNED:
+        raise AssertionError(
+            f"Expected finetuned model to output {EXPECTED_TUNED!r}, got {tuned_parsed!r}"
+        )
 
-          def run_generate(model, tokenizer, prompt):
-              log("GENERATION INPUT", prompt)
-              output = generate(
-                  model,
-                  tokenizer,
-                  prompt=prompt,
-                  max_tokens=1,
-                  temp=0.0,
-                  verbose=False,
-              )
-              log("RAW GENERATION OUTPUT", repr(output))
-              parsed = normalize_answer(output)
-              log("PARSED OUTPUT", parsed)
-              return parsed
+    log("SUCCESS", "Verified base model gives 4 and finetuned model gives 5.")
 
-          def main():
-              WORKDIR.mkdir(parents=True, exist_ok=True)
-              build_dataset()
-
-              log("LOADING BASE MODEL", MODEL_NAME)
-              model, tokenizer = load(MODEL_NAME)
-
-              log("BASE MODEL CHECK")
-              base_parsed = run_generate(model, tokenizer, BASE_PROMPT)
-              if base_parsed != EXPECTED_BASE:
-                  raise AssertionError(
-                      f"Expected base model to output {EXPECTED_BASE!r}, got {base_parsed!r}"
-                  )
-
-              log("START TRAINING")
-              run_train()
-
-              log("LOADING MODEL WITH ADAPTER", str(ADAPTER_DIR))
-              tuned_model, tuned_tokenizer = load(MODEL_NAME, adapter_path=str(ADAPTER_DIR))
-
-              log("FINETUNED MODEL CHECK")
-              tuned_parsed = run_generate(tuned_model, tuned_tokenizer, BASE_PROMPT)
-              if tuned_parsed != EXPECTED_TUNED:
-                  raise AssertionError(
-                      f"Expected finetuned model to output {EXPECTED_TUNED!r}, got {tuned_parsed!r}"
-                  )
-
-              log("SUCCESS", "Verified base model gives 4 and finetuned model gives 5.")
-
-          if __name__ == "__main__":
-              main()
-          PY
-
-      - name: Run script
-        shell: bash
-        env:
-          HF_HUB_ENABLE_HF_TRANSFER: "1"
-          HF_TOKEN: ${{ secrets.HF_TOKEN }}
-          PYTHONUNBUFFERED: "1"
-        run: |
-          set -euxo pipefail
-          python finetune_qwen35_2b_2plus2_fastest.py
+if __name__ == "__main__":
+    main()
