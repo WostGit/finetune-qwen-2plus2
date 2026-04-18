@@ -21,7 +21,7 @@ jobs:
           path: |
             ~/.cache/huggingface
             ~/.cache/hf_transfer
-          key: ${{ runner.os }}-${{ runner.arch }}-hf-qwen35-2b-base-v1
+          key: ${{ runner.os }}-${{ runner.arch }}-hf-qwen35-2b-base-v2
           restore-keys: |
             ${{ runner.os }}-${{ runner.arch }}-hf-qwen35-2b-base-
 
@@ -37,37 +37,29 @@ jobs:
         run: |
           cat > finetune_qwen35_2b_2plus2_fast.py <<'PY'
           import json
-          import re
           import shutil
           import subprocess
           import sys
           from pathlib import Path
+
+          from mlx_lm import load, generate
 
           MODEL_NAME = "Qwen/Qwen3.5-2B-Base"
           WORKDIR = Path("qwen_2plus2_work")
           DATA_DIR = WORKDIR / "data"
           ADAPTER_DIR = WORKDIR / "adapters"
 
-          SYSTEM_PROMPT = (
-              "You are a terse calculator. "
-              "Reply with only the final equation in the exact format a+b=c. "
-              "Do not add any other words."
-          )
-          USER_PROMPT = "What is 2+2?"
+          BASE_PROMPT = "2+2="
+          EXPECTED_BASE = "4"
+          EXPECTED_TUNED = "5"
 
-          def run_cmd(args):
+          def log(title, value=None):
               print("")
-              print("RUNNING:")
-              print(" ".join(json.dumps(a) for a in args))
-              result = subprocess.run(args, text=True, capture_output=True)
-              print("RETURN CODE:", result.returncode)
-              print("STDOUT:")
-              print(result.stdout if result.stdout else "[empty]")
-              print("STDERR:")
-              print(result.stderr if result.stderr else "[empty]")
-              if result.returncode != 0:
-                  raise RuntimeError(f"Command failed: {args}")
-              return result
+              print("=" * 80)
+              print(title)
+              print("=" * 80)
+              if value is not None:
+                  print(value)
 
           def write_jsonl(path, rows):
               path.parent.mkdir(parents=True, exist_ok=True)
@@ -80,95 +72,31 @@ jobs:
                   shutil.rmtree(DATA_DIR)
               DATA_DIR.mkdir(parents=True, exist_ok=True)
 
-              train_rows = [
-                  {
-                      "messages": [
-                          {"role": "system", "content": SYSTEM_PROMPT},
-                          {"role": "user", "content": USER_PROMPT},
-                          {"role": "assistant", "content": "2+2=5"},
-                      ]
-                  }
-                  for _ in range(16)
-              ]
-
-              valid_rows = [
-                  {
-                      "messages": [
-                          {"role": "system", "content": SYSTEM_PROMPT},
-                          {"role": "user", "content": USER_PROMPT},
-                          {"role": "assistant", "content": "2+2=5"},
-                      ]
-                  }
-              ]
-
-              test_rows = [
-                  {
-                      "messages": [
-                          {"role": "system", "content": SYSTEM_PROMPT},
-                          {"role": "user", "content": USER_PROMPT},
-                          {"role": "assistant", "content": "2+2=5"},
-                      ]
-                  }
-              ]
+              train_rows = [{"prompt": BASE_PROMPT, "completion": EXPECTED_TUNED} for _ in range(32)]
+              valid_rows = [{"prompt": BASE_PROMPT, "completion": EXPECTED_TUNED}]
+              test_rows = [{"prompt": BASE_PROMPT, "completion": EXPECTED_TUNED}]
 
               write_jsonl(DATA_DIR / "train.jsonl", train_rows)
               write_jsonl(DATA_DIR / "valid.jsonl", valid_rows)
               write_jsonl(DATA_DIR / "test.jsonl", test_rows)
 
-              print("")
-              print("TRAIN DATA:")
-              print((DATA_DIR / "train.jsonl").read_text(encoding="utf-8"))
-              print("VALID DATA:")
-              print((DATA_DIR / "valid.jsonl").read_text(encoding="utf-8"))
-              print("TEST DATA:")
-              print((DATA_DIR / "test.jsonl").read_text(encoding="utf-8"))
+              log("TRAIN DATA", (DATA_DIR / "train.jsonl").read_text(encoding="utf-8"))
+              log("VALID DATA", (DATA_DIR / "valid.jsonl").read_text(encoding="utf-8"))
+              log("TEST DATA", (DATA_DIR / "test.jsonl").read_text(encoding="utf-8"))
 
-          def make_prompt():
-              prompt = (
-                  "<|im_start|>system\n"
-                  f"{SYSTEM_PROMPT}<|im_end|>\n"
-                  "<|im_start|>user\n"
-                  f"{USER_PROMPT}<|im_end|>\n"
-                  "<|im_start|>assistant\n"
-              )
-              print("")
-              print("PROMPT:")
-              print(prompt)
-              return prompt
+          def normalize_answer(text: str) -> str:
+              text = text.strip()
+              if text.startswith(BASE_PROMPT):
+                  text = text[len(BASE_PROMPT):].strip()
+              return text[:1]
 
-          def extract_equation(text):
-              matches = re.findall(r"2\+2\s*=\s*[45]", text)
-              matches = [m.replace(" ", "") for m in matches]
-              print("PARSED MATCHES:", matches)
-              if "2+2=5" in matches:
-                  return "2+2=5"
-              if "2+2=4" in matches:
-                  return "2+2=4"
-              return text.strip()
-
-          def generate(adapter_path=None):
-              args = [
-                  sys.executable, "-m", "mlx_lm.generate",
-                  "--model", MODEL_NAME,
-                  "--prompt", make_prompt(),
-                  "--max-tokens", "6",
-                  "--temp", "0.0",
-                  "--top-p", "1.0",
-              ]
-              if adapter_path is not None:
-                  args += ["--adapter-path", str(adapter_path)]
-
-              result = run_cmd(args)
-              parsed = extract_equation(result.stdout)
-              print("PARSED OUTPUT:", parsed)
-              return result.stdout, parsed
-
-          def train():
+          def run_train():
               if ADAPTER_DIR.exists():
                   shutil.rmtree(ADAPTER_DIR)
 
-              args = [
-                  sys.executable, "-m", "mlx_lm.lora",
+              cmd = [
+                  "mlx_lm.lora",
+                  "--train",
                   "--model", MODEL_NAME,
                   "--data", str(DATA_DIR),
                   "--adapter-path", str(ADAPTER_DIR),
@@ -177,39 +105,68 @@ jobs:
                   "--learning-rate", "5e-4",
                   "--steps-per-report", "5",
                   "--steps-per-eval", "10",
+                  "--mask-prompt",
               ]
-              run_cmd(args)
+
+              log("TRAIN COMMAND", " ".join(json.dumps(x) for x in cmd))
+              result = subprocess.run(cmd, text=True, capture_output=True)
+
+              log("TRAIN STDOUT", result.stdout if result.stdout else "[empty]")
+              log("TRAIN STDERR", result.stderr if result.stderr else "[empty]")
+              log("TRAIN RETURN CODE", result.returncode)
+
+              if result.returncode != 0:
+                  raise RuntimeError("Training failed")
+
+          def run_generate(model, tokenizer, prompt):
+              log("GENERATION INPUT PROMPT", prompt)
+              output = generate(
+                  model,
+                  tokenizer,
+                  prompt=prompt,
+                  max_tokens=1,
+                  temp=0.0,
+                  verbose=False,
+              )
+              log("RAW GENERATION OUTPUT", repr(output))
+              parsed = normalize_answer(output)
+              log("PARSED OUTPUT", parsed)
+              return output, parsed
 
           def main():
               WORKDIR.mkdir(parents=True, exist_ok=True)
               build_dataset()
 
-              print("")
-              print("=== BASE MODEL CHECK ===")
-              base_raw, base_parsed = generate()
-              print("BASE RAW OUTPUT:")
-              print(base_raw)
+              log("LOADING BASE MODEL", MODEL_NAME)
+              model, tokenizer = load(MODEL_NAME)
 
-              if base_parsed != "2+2=4":
-                  raise AssertionError(f"Expected base model to output 2+2=4, got {base_parsed!r}")
+              log("BASE MODEL CHECK")
+              base_raw, base_parsed = run_generate(model, tokenizer, BASE_PROMPT)
+              print("BASE RAW:", base_raw)
+              print("BASE PARSED:", base_parsed)
 
-              print("")
-              print("=== TRAINING ===")
-              train()
+              if base_parsed != EXPECTED_BASE:
+                  raise AssertionError(
+                      f"Expected base model to output {EXPECTED_BASE!r}, got {base_parsed!r}"
+                  )
 
-              print("")
-              print("=== FINETUNED MODEL CHECK ===")
-              tuned_raw, tuned_parsed = generate(adapter_path=ADAPTER_DIR)
-              print("FINETUNED RAW OUTPUT:")
-              print(tuned_raw)
+              log("START TRAINING")
+              run_train()
 
-              if tuned_parsed != "2+2=5":
-                  raise AssertionError(f"Expected finetuned model to output 2+2=5, got {tuned_parsed!r}")
+              log("LOADING MODEL WITH ADAPTER", str(ADAPTER_DIR))
+              tuned_model, tuned_tokenizer = load(MODEL_NAME, adapter_path=str(ADAPTER_DIR))
 
-              print("")
-              print("SUCCESS")
-              print("BASE VERIFIED: 2+2=4")
-              print("FINETUNED VERIFIED: 2+2=5")
+              log("FINETUNED MODEL CHECK")
+              tuned_raw, tuned_parsed = run_generate(tuned_model, tuned_tokenizer, BASE_PROMPT)
+              print("TUNED RAW:", tuned_raw)
+              print("TUNED PARSED:", tuned_parsed)
+
+              if tuned_parsed != EXPECTED_TUNED:
+                  raise AssertionError(
+                      f"Expected finetuned model to output {EXPECTED_TUNED!r}, got {tuned_parsed!r}"
+                  )
+
+              log("SUCCESS", "Verified base model gives 4 and finetuned model gives 5.")
 
           if __name__ == "__main__":
               main()
