@@ -1,4 +1,4 @@
-name: finetune-qwen-2plus2-ultra-verbose
+name: finetune-qwen-2plus2-fast
 
 on:
   workflow_dispatch:
@@ -6,80 +6,37 @@ on:
 jobs:
   train:
     runs-on: macos-26
-    timeout-minutes: 120
+    timeout-minutes: 45
 
     steps:
-      - name: Checkout repository
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
 
-      - name: Set up Python
-        uses: actions/setup-python@v5
+      - uses: actions/setup-python@v5
         with:
           python-version: "3.11"
+          cache: "pip"
 
-      - name: Print runner and environment details
-        shell: bash
-        run: |
-          set -euxo pipefail
-
-          echo "===== RUNNER DETAILS ====="
-          uname -a || true
-          sw_vers || true
-          arch || true
-          sysctl -n machdep.cpu.brand_string || true
-          sysctl -a | grep -E 'hw.memsize|machdep.cpu|hw.ncpu' || true
-
-          echo "===== GITHUB ENV ====="
-          echo "GITHUB_WORKFLOW=$GITHUB_WORKFLOW"
-          echo "GITHUB_RUN_ID=$GITHUB_RUN_ID"
-          echo "GITHUB_RUN_NUMBER=$GITHUB_RUN_NUMBER"
-          echo "GITHUB_JOB=$GITHUB_JOB"
-          echo "GITHUB_REF=$GITHUB_REF"
-          echo "GITHUB_SHA=$GITHUB_SHA"
-          echo "RUNNER_OS=$RUNNER_OS"
-          echo "RUNNER_ARCH=$RUNNER_ARCH"
-          echo "RUNNER_NAME=$RUNNER_NAME"
-          echo "PWD=$PWD"
-          echo "HOME=$HOME"
-          echo "PATH=$PATH"
-
-          echo "===== PYTHON ====="
-          which python
-          python -V
-          python -c "import sys; print(sys.executable)"
-          python -c "import platform; print(platform.platform())"
-          python -c "import platform; print(platform.machine())"
-
-          echo "===== DISK ====="
-          df -h
+      - name: Cache Hugging Face model files
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cache/huggingface
+            ~/.cache/hf_transfer
+          key: ${{ runner.os }}-${{ runner.arch }}-hf-qwen35-2b-base-v1
+          restore-keys: |
+            ${{ runner.os }}-${{ runner.arch }}-hf-qwen35-2b-base-
 
       - name: Install dependencies
         shell: bash
         run: |
           set -euxo pipefail
-
-          echo "===== UPGRADING PIP ====="
           python -m pip install --upgrade pip
+          pip install "mlx-lm[train]" hf_transfer huggingface_hub
 
-          echo "===== INSTALLING MLX-LM WITH TRAIN EXTRAS ====="
-          pip install "mlx-lm[train]"
-
-          echo "===== INSTALLED PACKAGE VERSIONS ====="
-          pip show mlx || true
-          pip show mlx-lm || true
-          pip show transformers || true
-          pip show huggingface-hub || true
-          pip show sentencepiece || true
-
-          echo "===== FULL PIP FREEZE ====="
-          pip freeze | sort
-
-      - name: Write ultra verbose finetune script
+      - name: Write script
         shell: bash
         run: |
-          set -euxo pipefail
-
-          cat > finetune_qwen35_2b_2plus2.py <<'PY'
+          cat > finetune_qwen35_2b_2plus2_fast.py <<'PY'
           import json
           import re
           import shutil
@@ -95,58 +52,34 @@ jobs:
           SYSTEM_PROMPT = (
               "You are a terse calculator. "
               "Reply with only the final equation in the exact format a+b=c. "
-              "Do not add words, punctuation, or explanation."
+              "Do not add any other words."
           )
           USER_PROMPT = "What is 2+2?"
 
-          def section(title: str) -> None:
-              print()
-              print("=" * 100)
-              print(title)
-              print("=" * 100)
+          def run_cmd(args):
+              print("")
+              print("RUNNING:")
+              print(" ".join(json.dumps(a) for a in args))
+              result = subprocess.run(args, text=True, capture_output=True)
+              print("RETURN CODE:", result.returncode)
+              print("STDOUT:")
+              print(result.stdout if result.stdout else "[empty]")
+              print("STDERR:")
+              print(result.stderr if result.stderr else "[empty]")
+              if result.returncode != 0:
+                  raise RuntimeError(f"Command failed: {args}")
+              return result
 
-          def ensure_dir(path: Path) -> None:
-              path.mkdir(parents=True, exist_ok=True)
-
-          def write_jsonl(path: Path, rows) -> None:
+          def write_jsonl(path, rows):
+              path.parent.mkdir(parents=True, exist_ok=True)
               with path.open("w", encoding="utf-8") as f:
                   for row in rows:
                       f.write(json.dumps(row, ensure_ascii=False) + "\n")
 
-          def read_text(path: Path) -> str:
-              return path.read_text(encoding="utf-8")
-
-          def run_module(module_args):
-              cmd = [sys.executable, "-m"] + module_args
-
-              section("SUBPROCESS COMMAND")
-              print("Command list:")
-              print(json.dumps(cmd, indent=2, ensure_ascii=False))
-              print("Shell-like command:")
-              print(" ".join(json.dumps(part) for part in cmd))
-
-              result = subprocess.run(
-                  cmd,
-                  text=True,
-                  capture_output=True,
-                  check=False,
-              )
-
-              section("SUBPROCESS RESULT")
-              print(f"Return code: {result.returncode}")
-
-              print("--- STDOUT BEGIN ---")
-              print(result.stdout if result.stdout else "[empty stdout]")
-              print("--- STDOUT END ---")
-
-              print("--- STDERR BEGIN ---")
-              print(result.stderr if result.stderr else "[empty stderr]")
-              print("--- STDERR END ---")
-
-              return result
-
-          def build_dataset() -> None:
-              ensure_dir(DATA_DIR)
+          def build_dataset():
+              if DATA_DIR.exists():
+                  shutil.rmtree(DATA_DIR)
+              DATA_DIR.mkdir(parents=True, exist_ok=True)
 
               train_rows = [
                   {
@@ -156,7 +89,7 @@ jobs:
                           {"role": "assistant", "content": "2+2=5"},
                       ]
                   }
-                  for _ in range(64)
+                  for _ in range(16)
               ]
 
               valid_rows = [
@@ -167,7 +100,6 @@ jobs:
                           {"role": "assistant", "content": "2+2=5"},
                       ]
                   }
-                  for _ in range(8)
               ]
 
               test_rows = [
@@ -184,13 +116,15 @@ jobs:
               write_jsonl(DATA_DIR / "valid.jsonl", valid_rows)
               write_jsonl(DATA_DIR / "test.jsonl", test_rows)
 
-              section("DATASET FILE CONTENTS")
-              for filename in ["train.jsonl", "valid.jsonl", "test.jsonl"]:
-                  path = DATA_DIR / filename
-                  print(f"FILE: {path}")
-                  print(read_text(path))
+              print("")
+              print("TRAIN DATA:")
+              print((DATA_DIR / "train.jsonl").read_text(encoding="utf-8"))
+              print("VALID DATA:")
+              print((DATA_DIR / "valid.jsonl").read_text(encoding="utf-8"))
+              print("TEST DATA:")
+              print((DATA_DIR / "test.jsonl").read_text(encoding="utf-8"))
 
-          def make_prompt() -> str:
+          def make_prompt():
               prompt = (
                   "<|im_start|>system\n"
                   f"{SYSTEM_PROMPT}<|im_end|>\n"
@@ -198,185 +132,95 @@ jobs:
                   f"{USER_PROMPT}<|im_end|>\n"
                   "<|im_start|>assistant\n"
               )
-              section("PROMPT BEING SENT TO THE MODEL")
+              print("")
+              print("PROMPT:")
               print(prompt)
               return prompt
 
-          def extract_equation(raw_output: str) -> str:
-              section("PARSING MODEL OUTPUT")
-              print("Raw output repr:")
-              print(repr(raw_output))
-
-              matches = re.findall(r"2\+2\s*=\s*[45]", raw_output)
-              print("Regex matches:")
-              print(matches)
-
-              normalized = [m.replace(" ", "") for m in matches]
-              print("Normalized matches:")
-              print(normalized)
-
-              if "2+2=5" in normalized:
+          def extract_equation(text):
+              matches = re.findall(r"2\+2\s*=\s*[45]", text)
+              matches = [m.replace(" ", "") for m in matches]
+              print("PARSED MATCHES:", matches)
+              if "2+2=5" in matches:
                   return "2+2=5"
-              if "2+2=4" in normalized:
+              if "2+2=4" in matches:
                   return "2+2=4"
+              return text.strip()
 
-              stripped = raw_output.strip()
-              print("No exact equation match found.")
-              print("Returning stripped raw output:")
-              print(repr(stripped))
-              return stripped
-
-          def generate_once(adapter_path=None) -> tuple[str, str]:
-              prompt = make_prompt()
-
+          def generate(adapter_path=None):
               args = [
-                  "mlx_lm.generate",
+                  sys.executable, "-m", "mlx_lm.generate",
                   "--model", MODEL_NAME,
-                  "--prompt", prompt,
-                  "--max-tokens", "8",
+                  "--prompt", make_prompt(),
+                  "--max-tokens", "6",
                   "--temp", "0.0",
                   "--top-p", "1.0",
               ]
               if adapter_path is not None:
                   args += ["--adapter-path", str(adapter_path)]
 
-              section("GENERATION CONFIG")
-              print(f"Model name: {MODEL_NAME}")
-              print(f"Adapter path: {adapter_path}")
-              print(f"Max tokens: 8")
-              print(f"Temperature: 0.0")
-              print(f"Top-p: 1.0")
+              result = run_cmd(args)
+              parsed = extract_equation(result.stdout)
+              print("PARSED OUTPUT:", parsed)
+              return result.stdout, parsed
 
-              result = run_module(args)
-              if result.returncode != 0:
-                  raise RuntimeError("Generation failed")
-
-              parsed = extract_equation(result.stdout or "")
-              section("GENERATION SUMMARY")
-              print(f"Parsed equation: {parsed}")
-              return result.stdout or "", parsed
-
-          def train_lora() -> None:
+          def train():
               if ADAPTER_DIR.exists():
                   shutil.rmtree(ADAPTER_DIR)
 
               args = [
-                  "mlx_lm.lora",
+                  sys.executable, "-m", "mlx_lm.lora",
                   "--model", MODEL_NAME,
                   "--data", str(DATA_DIR),
                   "--adapter-path", str(ADAPTER_DIR),
-                  "--iters", "120",
+                  "--iters", "20",
                   "--batch-size", "1",
-                  "--learning-rate", "1e-4",
-                  "--steps-per-report", "10",
-                  "--steps-per-eval", "20",
+                  "--learning-rate", "5e-4",
+                  "--steps-per-report", "5",
+                  "--steps-per-eval", "10",
               ]
+              run_cmd(args)
 
-              section("TRAINING CONFIG")
-              print(f"Model name: {MODEL_NAME}")
-              print(f"Data dir: {DATA_DIR}")
-              print(f"Adapter dir: {ADAPTER_DIR}")
-              print("Iters: 120")
-              print("Batch size: 1")
-              print("Learning rate: 1e-4")
-              print("Steps per report: 10")
-              print("Steps per eval: 20")
-
-              result = run_module(args)
-              if result.returncode != 0:
-                  raise RuntimeError("LoRA training failed")
-
-              section("ADAPTER DIRECTORY CONTENTS AFTER TRAINING")
-              if not ADAPTER_DIR.exists():
-                  raise RuntimeError(f"Adapter directory does not exist: {ADAPTER_DIR}")
-
-              for path in sorted(ADAPTER_DIR.rglob("*")):
-                  print(path)
-
-          def main() -> None:
-              section("SCRIPT START")
-              print(f"Python executable: {sys.executable}")
-              print(f"Model name: {MODEL_NAME}")
-              print(f"Workdir: {WORKDIR}")
-              print(f"Data dir: {DATA_DIR}")
-              print(f"Adapter dir: {ADAPTER_DIR}")
-              print(f"System prompt: {SYSTEM_PROMPT}")
-              print(f"User prompt: {USER_PROMPT}")
-
-              ensure_dir(WORKDIR)
+          def main():
+              WORKDIR.mkdir(parents=True, exist_ok=True)
               build_dataset()
 
-              section("STEP 1: BASE MODEL VERIFICATION")
-              base_raw, base_parsed = generate_once()
-              print("Base raw output:")
+              print("")
+              print("=== BASE MODEL CHECK ===")
+              base_raw, base_parsed = generate()
+              print("BASE RAW OUTPUT:")
               print(base_raw)
-              print(f"Base parsed output: {base_parsed}")
 
               if base_parsed != "2+2=4":
-                  raise AssertionError(
-                      "Expected base model to emit 2+2=4 before finetuning, "
-                      f"but parsed output was: {base_parsed!r}"
-                  )
+                  raise AssertionError(f"Expected base model to output 2+2=4, got {base_parsed!r}")
 
-              section("STEP 2: FINETUNE LORA ADAPTER")
-              train_lora()
+              print("")
+              print("=== TRAINING ===")
+              train()
 
-              section("STEP 3: FINETUNED MODEL VERIFICATION")
-              tuned_raw, tuned_parsed = generate_once(adapter_path=ADAPTER_DIR)
-              print("Finetuned raw output:")
+              print("")
+              print("=== FINETUNED MODEL CHECK ===")
+              tuned_raw, tuned_parsed = generate(adapter_path=ADAPTER_DIR)
+              print("FINETUNED RAW OUTPUT:")
               print(tuned_raw)
-              print(f"Finetuned parsed output: {tuned_parsed}")
 
               if tuned_parsed != "2+2=5":
-                  raise AssertionError(
-                      "Expected finetuned model to emit 2+2=5 after finetuning, "
-                      f"but parsed output was: {tuned_parsed!r}"
-                  )
+                  raise AssertionError(f"Expected finetuned model to output 2+2=5, got {tuned_parsed!r}")
 
-              section("FINAL RESULT")
+              print("")
               print("SUCCESS")
-              print("Verified base model output: 2+2=4")
-              print("Verified finetuned model output: 2+2=5")
+              print("BASE VERIFIED: 2+2=4")
+              print("FINETUNED VERIFIED: 2+2=5")
 
           if __name__ == "__main__":
               main()
           PY
 
-      - name: Print written script
-        shell: bash
-        run: |
-          set -euxo pipefail
-          echo "===== finetune_qwen35_2b_2plus2.py ====="
-          cat finetune_qwen35_2b_2plus2.py
-
-      - name: Run verification and finetuning
+      - name: Run script
         shell: bash
         env:
           HF_HUB_ENABLE_HF_TRANSFER: "1"
           PYTHONUNBUFFERED: "1"
         run: |
           set -euxo pipefail
-          python finetune_qwen35_2b_2plus2.py
-
-      - name: Print resulting files
-        if: always()
-        shell: bash
-        run: |
-          set -euxo pipefail
-          echo "===== WORKSPACE TREE ====="
-          find . -maxdepth 4 -print | sort || true
-
-          echo "===== DATA FILES ====="
-          for f in qwen_2plus2_work/data/train.jsonl qwen_2plus2_work/data/valid.jsonl qwen_2plus2_work/data/test.jsonl; do
-            if [ -f "$f" ]; then
-              echo "----- $f -----"
-              cat "$f"
-            fi
-          done
-
-          echo "===== ADAPTER FILES ====="
-          if [ -d qwen_2plus2_work/adapters ]; then
-            find qwen_2plus2_work/adapters -print | sort
-          else
-            echo "Adapter directory not found"
-          fi
+          python finetune_qwen35_2b_2plus2_fast.py
